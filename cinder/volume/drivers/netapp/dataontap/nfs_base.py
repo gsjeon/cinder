@@ -48,6 +48,7 @@ from cinder.volume.drivers.netapp import options as na_opts
 from cinder.volume.drivers.netapp import utils as na_utils
 from cinder.volume.drivers import nfs
 from cinder.volume import volume_utils
+from cinder.volume import volume_format
 
 
 LOG = logging.getLogger(__name__)
@@ -164,6 +165,15 @@ class NetAppNfsDriver(driver.ManageableVD,
             self._do_qos_for_volume(volume, extra_specs)
             model_update = self._get_volume_model_update(volume) or {}
             model_update['provider_location'] = volume['provider_location']
+
+            # format
+            self.configuration.append_config_values(
+                    volume_format.volume_format_opts)
+
+            if (CONF.empty_volume_format and
+                    volume['metadata'].get('fsType') is not None):
+                self._create_format(volume)
+
             return model_update
         except Exception:
             LOG.exception("Exception creating vol %(name)s on "
@@ -1247,3 +1257,50 @@ class NetAppNfsDriver(driver.ManageableVD,
         # and breaking volume's backend QoS.
         msg = _("The method update_migrated_volume is not implemented.")
         raise NotImplementedError(msg)
+
+    def _create_device_maps(self, device):
+        """Mapping the volume to host."""
+        result = self._execute('kpartx', '-av', device,
+                    check_exit_code=True, run_as_root=self._execute_as_root)
+        device = "/dev/mapper/" + result[0].split()[2]
+        return device
+
+    def _remove_device_maps(self, device):
+        """Unmap the volume from host."""
+        return self._execute('kpartx', '-dv', device,
+                     check_exit_code=True,run_as_root=self._execute_as_root)
+
+    def _create_format(self, volume):
+        """Create a volume format.
+
+        :param volume: volume reference
+        """
+        fs_type = volume['metadata'].get('fsType')
+
+        if not volume_format.validate_format(fs_type):
+            err_msg = _('Unsupported format type: %s') % fs_type
+            LOG.debug(err_msg)
+            return
+
+        LOG.info('Format to %(type)s filesystem. volume: %(vol)s',
+                dict(type=fs_type, vol=volume.id))
+
+        try:
+            nfs_share = self._get_provider_location(volume['id'])
+            vol_path = self._get_volume_path(nfs_share, volume['name'])
+
+            # volume partition
+            volume_format.create_partition_table(vol_path, 'msdos')
+            volume_format.create_partition(vol_path, 'primary', fs_type, '0%', '100%')
+
+            # mapping the volume to host device
+            device = self._create_device_maps(vol_path)
+
+            # format
+            volume_format.mkfs(fs_type, device)
+
+            # unmap the device
+            self._remove_device_maps(vol_path)
+
+        except Exception:
+            LOG.exception("Exception volume format: %s", volume['id'])
