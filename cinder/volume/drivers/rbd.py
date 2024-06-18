@@ -60,6 +60,7 @@ from cinder.volume import configuration
 from cinder.volume import driver
 from cinder.volume import qos_specs
 from cinder.volume import volume_utils
+from cinder.volume import volume_format
 
 LOG = logging.getLogger(__name__)
 
@@ -1180,6 +1181,14 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
                 LOG.error('Error creating RBD image %(vol)s.',
                           {'vol': vol_name})
                 self.RBDProxy().remove(client.ioctx, vol_name)
+
+        # format
+        self.configuration.append_config_values(
+                volume_format.volume_format_opts)
+
+        if (CONF.empty_volume_format and
+                volume['metadata'].get('fsType') is not None):
+            self._create_format(volume)
 
         return volume_update
 
@@ -2587,3 +2596,49 @@ class RBDDriver(driver.CloneableImageVD, driver.MigrateVD,
                       'rbd_image_name': volume.name,
                       'error': e})
             raise exception.VolumeBackendAPIException(data=msg)
+
+    def _create_device_maps(self, device):
+        """Mapping the volume to host."""
+        args = ['rbd', 'map',
+                '--pool', self.configuration.rbd_pool,
+                device]
+        args.extend(self._ceph_args())
+        result = self._execute(*args)
+        device = result[0].replace("\n", "")
+        return device
+
+    def _remove_device_maps(self, device):
+        """Unmap the volume from host."""
+        return self._execute('rbd', 'unmap', device)
+
+    def _create_format(self, volume):
+        """Create a volume format.
+        :param volume: volume reference
+        """
+        fs_type = volume['metadata'].get('fsType')
+
+        if not volume_format.validate_format(fs_type):
+            err_msg = _('Unsupported format type: %s') % fs_type
+            LOG.debug(err_msg)
+            return
+
+        LOG.info('Format to %(type)s filesystem. volume: %(vol)s',
+                dict(type=fs_type, vol=volume.id))
+
+        try:
+            # mapping the volume to host device
+            device = self._create_device_maps(volume.id)
+
+            # volume partition
+            volume_format.create_partition_table(device, 'msdos')
+            volume_format.create_partition(device, 'primary', fs_type, '0%', '100%')
+
+            # format
+            partition = device + "p1"
+            volume_format.mkfs(fs_type, partition)
+
+            # unmap the device
+            self._remove_device_maps(device)
+
+        except Exception:
+            LOG.exception("Exception volume format: %s", volume.id)
